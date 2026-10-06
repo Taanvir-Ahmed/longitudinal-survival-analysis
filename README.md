@@ -70,9 +70,7 @@ Built with R 4.3.3. Rendering takes under a minute.
 
 ## Data
 
-The dataset is **simulated**; it contains no real patient information. It was
-provided by the course instructor for teaching purposes and is shared here with
-their permission.
+The dataset is **simulated**; it contains no real patient information.
 
 Variables: `id`, `treatment` (0 = standard, 1 = new), `age`, `sex` (0 = female, 1 = male),
 `bio_0`, `bio_3`, `bio_6`, `bio_12` (biomarker at 0/3/6/12 months), `follow`
@@ -80,7 +78,7 @@ Variables: `id`, `treatment` (0 = standard, 1 = new), `age`, `sex` (0 = female, 
 
 ## Author
 
-**Tanvir Ahmed**: originally completed as the final project of the course *Longitudinal and Survival Data Analysis*, then revised into this reproducible report.
+**Tanvir Ahmed**
 
 ## License
 
