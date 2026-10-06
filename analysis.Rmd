@@ -1,0 +1,652 @@
+---
+title: "Longitudinal and Survival Analysis of a Simulated Clinical Follow-up Study"
+subtitle: "Biomarker trajectories and time to death under standard vs new treatment"
+author: "Tanvir Ahmed"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    number_sections: true
+    code_folding: show
+    df_print: kable
+    theme: flatly
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 8, fig.height = 4.8, dpi = 150, fig.align = "center"
+)
+```
+
+> **About this project.** This analysis was originally completed as the final
+> assignment of a university course in *Longitudinal and Survival Data Analysis*.
+> The dataset is simulated and was provided by the course instructor. The
+> analysis has since been rewritten as a single reproducible document, and the
+> statistical reasoning has been revised (see [What was revised](#revisions)).
+
+# Study and research questions
+
+Data come from a simulated clinical follow-up study of **240 adults with a
+chronic disease**, allocated to **standard treatment** (`treatment = 0`, n = 134)
+or a **new treatment** (`treatment = 1`, n = 106).
+
+* A continuous **biomarker** was measured at baseline and at 3, 6 and 12 months.
+* **Survival** (time to death, in years) was then followed for up to seven years.
+
+| Variable | Description |
+|---|---|
+| `id` | patient identifier |
+| `treatment` | 0 = standard, 1 = new treatment |
+| `age` | age at baseline (years) |
+| `sex` | 0 = female, 1 = male |
+| `bio_0`, `bio_3`, `bio_6`, `bio_12` | biomarker at 0, 3, 6, 12 months |
+| `follow` | survival follow-up time (years) |
+| `death` | 1 = died, 0 = censored |
+
+The analysis answers four questions:
+
+1. **How does the biomarker change over time, and does the change differ between treatments?**
+   (exploratory plots, repeated-measures ANOVA, linear mixed models, GEE)
+2. **How much of the biomarker variation is between patients rather than within them?**
+   (variance components, ICC, random slopes)
+3. **Does the new treatment improve survival?** (Kaplan–Meier, log-rank, Cox regression)
+4. **Is the baseline biomarker prognostic, and does it change the estimated treatment effect?**
+
+```{r packages}
+library(tidyverse)   # data handling and plotting
+library(afex)        # repeated-measures ANOVA
+library(emmeans)     # estimated marginal means
+library(lme4)        # linear mixed models
+library(lmerTest)    # p-values for mixed-model fixed effects
+library(geepack)     # generalized estimating equations
+library(survival)    # Kaplan-Meier and Cox models
+library(broom)
+library(broom.mixed)
+library(knitr)
+
+theme_set(theme_minimal(base_size = 12))
+trt_cols   <- c("Standard" = "#2C7FB8", "New" = "#D95F0E")
+dir.create("figures", showWarnings = FALSE)
+save_fig <- function(p, name, w = 8, h = 4.8) {
+  ggsave(file.path("figures", name), p, width = w, height = h, dpi = 150, bg = "white")
+  p
+}
+```
+
+# Data preparation
+
+```{r read}
+data_wide <- read.table("data/extra_data.txt", header = TRUE) |>
+  mutate(trt = factor(treatment, levels = 0:1, labels = c("Standard", "New")))
+
+dim(data_wide)
+anyNA(data_wide)
+```
+
+The data have one row per patient (240 × 10), no missing values, and the four
+biomarker visits stored in separate columns (wide format). Longitudinal models
+need one row per measurement occasion, so the data are reshaped to long format
+with both a **numeric** time (months; for modelling trends) and a **categorical**
+time (for visit-by-visit comparisons without assuming a shape).
+
+```{r long}
+data_long <- data_wide |>
+  pivot_longer(starts_with("bio_"), names_to = "visit", values_to = "biomarker") |>
+  mutate(
+    time_numeric = as.numeric(sub("bio_", "", visit)),
+    time_factor  = factor(time_numeric, levels = c(0, 3, 6, 12)),
+    id           = factor(id),
+    age_c        = age - mean(data_wide$age)   # centred age, used in the mixed models
+  )
+
+table(data_long$time_factor)
+stopifnot(nrow(data_long) == 240 * 4)
+```
+
+Each of the four visits contains exactly 240 measurements (240 × 4 = 960 rows),
+so the restructuring is complete and every patient contributes a full profile.
+
+**Baseline characteristics by group**
+
+```{r baseline}
+data_wide |>
+  group_by(Treatment = trt) |>
+  summarise(
+    n            = n(),
+    `Age, mean (SD)`        = sprintf("%.1f (%.1f)", mean(age), sd(age)),
+    `Male, %`               = sprintf("%.0f", 100 * mean(sex)),
+    `Baseline biomarker, mean (SD)` = sprintf("%.1f (%.1f)", mean(bio_0), sd(bio_0)),
+    Deaths       = sum(death)
+  ) |>
+  kable()
+
+t.test(bio_0 ~ trt, data = data_wide)
+```
+
+An important observation for later: the groups **already differ at baseline**
+in the biomarker (about 3 units lower in the new-treatment group, p < 0.001).
+In a randomised trial this would be a chance imbalance; either way it matters
+when interpreting treatment "main effects" and when adjusting for `bio_0` in the
+survival models.
+
+# Exploratory analysis
+
+```{r fig-trajectories, fig.height = 4.5}
+mean_profiles <- data_long |>
+  group_by(trt, time_numeric) |>
+  summarise(mean = mean(biomarker), se = sd(biomarker) / sqrt(n()), .groups = "drop")
+
+p_traj <- ggplot(data_long, aes(time_numeric, biomarker)) +
+  geom_line(aes(group = id, colour = trt), alpha = 0.18, linewidth = 0.35) +
+  geom_line(data = mean_profiles, aes(y = mean, colour = trt), linewidth = 1.4) +
+  geom_point(data = mean_profiles, aes(y = mean, colour = trt), size = 2.6) +
+  scale_colour_manual(values = trt_cols) +
+  scale_x_continuous(breaks = c(0, 3, 6, 12)) +
+  labs(x = "Months since baseline", y = "Biomarker", colour = "Treatment",
+       title = "Individual biomarker trajectories with group means") +
+  theme(legend.position = "top")
+
+save_fig(p_traj, "01_trajectories.png")
+```
+
+```{r mean-table}
+mean_profiles |>
+  select(-se) |>
+  pivot_wider(names_from = time_numeric, values_from = mean, names_prefix = "Month ") |>
+  mutate(`Change 0→12` = `Month 12` - `Month 0`) |>
+  kable(digits = 1)
+```
+
+**What the plot shows**
+
+* **Between-subject variability is large.** Baseline values range from about 46
+  to 80, and patients keep their relative position over time (lines run roughly
+  parallel), which points to a strong patient-level random intercept.
+* **Within-subject trend.** Almost all trajectories decline, roughly linearly in
+  time, with visit-to-visit noise around each patient's line.
+* **Treatment difference.** The new-treatment group falls by about 17.5 units over
+  12 months compared with about 10.6 units under standard treatment, so the group
+  means diverge over time. The new group also starts about 3 units lower.
+
+These are descriptive impressions; the models below test them formally.
+
+# Repeated-measures ANOVA
+
+Treatment is a between-subject factor and visit a within-subject factor. The
+classical repeated-measures ANOVA assumes **sphericity** (implied by compound
+symmetry: equal variances at all visits and equal correlation between any two
+visits).
+
+```{r rmanova}
+anova_rm <- aov_car(
+  biomarker ~ trt * time_factor + Error(id / time_factor),
+  data = data_long,
+  anova_table = list(correction = "none", es = "pes")
+)
+anova_rm
+```
+
+```{r rmanova-emm}
+emmeans(anova_rm, ~ trt | time_factor) |> as_tibble() |>
+  select(time_factor, trt, emmean, SE) |> kable(digits = 2)
+```
+
+* **Time** (F = 721.9, p < 0.001): the biomarker changes strongly over follow-up.
+* **Treatment** (F = 129.2, p < 0.001): averaged over visits, the new-treatment
+  group is lower. Part of this is the baseline imbalance noted above, so the main
+  effect alone should not be read as a treatment effect.
+* **Treatment × time** (F = 42.5, p < 0.001): the groups change at different
+  rates. This interaction is the effect of interest: the gap grows from about
+  3 units at baseline to about 10 units at 12 months.
+
+## Checking the assumptions
+
+```{r sphericity}
+summary(anova_rm)$sphericity.tests
+summary(anova_rm)$pval.adjustments
+```
+
+```{r gg-corrected}
+nice(anova_rm, correction = "GG")
+```
+
+```{r cov-structure}
+wide_bio <- data_wide |> select(bio_0, bio_3, bio_6, bio_12)
+round(apply(wide_bio, 2, var), 1)       # variances by visit
+round(cor(wide_bio), 2)                 # correlations between visits
+```
+
+```{r fig-rm-resid, fig.height = 3.6}
+rm_resid <- tibble(resid = residuals(anova_rm))
+
+p_qq <- ggplot(rm_resid, aes(sample = resid)) +
+  stat_qq(alpha = 0.4, size = 0.9) + stat_qq_line(colour = "#D95F0E") +
+  labs(title = "Normal Q-Q plot of RM-ANOVA residuals",
+       x = "Theoretical quantiles", y = "Residual")
+save_fig(p_qq, "02_rmanova_qq.png", h = 3.6)
+```
+
+**Assessment.**
+
+* **Normality:** residuals from the repeated-measures model lie close to the
+  Q-Q line, with only slight deviation in the tails.
+* **Sphericity:** this is the condition the within-subject F-tests actually
+  require. It holds: Mauchly's test is far from significant (p = 0.99) and the
+  Greenhouse–Geisser ε ≈ 1.00, so the corrected tests are identical to the
+  uncorrected ones.
+* **Compound symmetry** is a stronger, sufficient condition, and it does *not*
+  strictly hold. The pooled variance grows from about 30 at baseline to about
+  55 at 12 months, partly because the two groups drift apart. The between-visit
+  correlations are similar (0.60–0.75) but not equal. Sphericity can hold
+  without compound symmetry, so the F-tests remain valid.
+* **Other limits:** RM-ANOVA treats time as unordered categories, cannot adjust
+  for continuous covariates such as age, and drops any patient with a missing
+  visit. The mixed models below address all three.
+
+# Linear mixed model with a random intercept
+
+$$
+\text{bio}_{ij} = \beta_0 + \beta_1 t_{ij} + \beta_2\,\text{trt}_i + \beta_3\,(t_{ij}\times\text{trt}_i)
++ \beta_4\,\text{age}^{c}_i + \beta_5\,\text{sex}_i + b_{0i} + \varepsilon_{ij},
+\qquad b_{0i}\sim N(0,\sigma_b^2),\ \varepsilon_{ij}\sim N(0,\sigma^2)
+$$
+
+Age is **centred at the sample mean** (`r round(mean(data_wide$age), 1)` years),
+so the intercept is the expected baseline value for a female patient of average
+age under standard treatment, rather than a value at age 0.
+
+```{r lmm-ri}
+model_ri <- lmer(
+  biomarker ~ time_numeric * treatment + age_c + sex + (1 | id),
+  data = data_long, REML = TRUE
+)
+
+fixef_tab <- tidy(model_ri, effects = "fixed", conf.int = TRUE) |>
+  select(term, estimate, std.error, conf.low, conf.high, p.value)
+kable(fixef_tab, digits = c(0, 3, 3, 3, 3, 4),
+      col.names = c("Term", "Estimate", "SE", "95% CI low", "95% CI high", "p"))
+```
+
+```{r lmm-slopes}
+b <- fixef(model_ri)
+slopes <- c(Standard = b[["time_numeric"]],
+            New      = b[["time_numeric"]] + b[["time_numeric:treatment"]])
+round(slopes, 3)
+```
+
+**Interpretation**
+
+* Under standard treatment the biomarker falls by about **0.90 units per month**.
+* The **time × treatment interaction (−0.56 per month, 95% CI shown above)** means
+  the new-treatment group declines faster, by about **1.46 units per month**.
+  Over 12 months that adds up to roughly 6.7 extra units of reduction.
+* The `treatment` coefficient (−3.8) is the group difference **at baseline**. It
+  reflects the baseline imbalance, not an effect of treatment, because no
+  treatment has acted at month 0.
+* **Age:** each additional year is associated with a slightly higher biomarker
+  (≈ 0.14 units). **Sex:** the confidence interval is wide and includes zero, so
+  there is no clear sex difference.
+
+## Variance components and ICC
+
+```{r icc}
+vc <- as.data.frame(VarCorr(model_ri))
+sigma2_b <- vc$vcov[vc$grp == "id"]
+sigma2_e <- vc$vcov[vc$grp == "Residual"]
+icc <- sigma2_b / (sigma2_b + sigma2_e)
+
+tibble(Component = c("Between-patient (random intercept)", "Within-patient (residual)"),
+       Variance  = c(sigma2_b, sigma2_e),
+       SD        = sqrt(c(sigma2_b, sigma2_e))) |>
+  kable(digits = 2)
+round(icc, 3)
+```
+
+The **ICC ≈ 0.57**. After accounting for time, treatment, age and sex, 57% of the
+remaining variance is due to stable differences between patients. Two
+measurements from the same patient therefore correlate at about 0.57. Ignoring
+this clustering (ordinary regression) would understate the standard errors of
+between-patient effects.
+
+**The random intercept** \(b_{0i}\) is each patient's personal deviation from the
+population baseline level. Patients differ in where they start, with an SD of
+about `r round(sqrt(sigma2_b), 1)` units, but in this model they all share the same
+treatment-specific rate of change.
+
+```{r fig-ranef, fig.height = 3.4}
+re <- ranef(model_ri)$id |> rownames_to_column("id") |> rename(b0 = `(Intercept)`)
+p_re <- ggplot(re, aes(sample = b0)) +
+  stat_qq(alpha = 0.5, size = 1) + stat_qq_line(colour = "#D95F0E") +
+  labs(title = "Predicted random intercepts (Q-Q)", x = "Theoretical quantiles", y = "b0")
+save_fig(p_re, "03_random_intercepts_qq.png", h = 3.4)
+```
+
+# Do patients differ in their rate of change? (random slopes)
+
+```{r lmm-rs}
+model_rs <- lmer(
+  biomarker ~ time_numeric * treatment + age_c + sex + (time_numeric | id),
+  data = data_long, REML = TRUE
+)
+VarCorr(model_rs)
+isSingular(model_rs)
+```
+
+The two models have the same fixed effects, so I compare them with a
+likelihood-ratio test on the **REML** fits (`refit = FALSE`). The ML refit used by
+default is meant for comparing fixed effects.
+
+```{r lrt}
+lrt <- anova(model_ri, model_rs, refit = FALSE)
+lrt
+
+# The null hypothesis puts the slope variance on the boundary of its space
+# (sigma^2_slope = 0), so the naive chi-square(2) p-value is conservative.
+# The correct reference is a 50:50 mixture of chi-square(1) and chi-square(2).
+chisq <- lrt$Chisq[2]
+p_mixture <- 0.5 * pchisq(chisq, 1, lower.tail = FALSE) +
+             0.5 * pchisq(chisq, 2, lower.tail = FALSE)
+round(c(LRT = chisq, p_naive = lrt$`Pr(>Chisq)`[2], p_mixture = p_mixture), 3)
+```
+
+**Which model?** The random-intercept model is preferred.
+
+* *Statistically:* the random-slope variance is essentially zero (a singular,
+  boundary fit). The likelihood-ratio test is non-significant even with the
+  correct boundary-adjusted mixture p-value, and AIC/BIC do not favour the larger
+  model.
+* *Practically:* patients differ mainly in **level**, not in **rate** of decline.
+  The simpler model is stable, easier to explain, and gives the same fixed
+  effects. Its residual plot (below) shows no structure left over.
+
+```{r fig-lmm-resid, fig.height = 3.6}
+p_fit <- tibble(fitted = fitted(model_ri), resid = resid(model_ri)) |>
+  ggplot(aes(fitted, resid)) +
+  geom_hline(yintercept = 0, colour = "grey50") +
+  geom_point(alpha = 0.35, size = 1) +
+  geom_smooth(se = FALSE, colour = "#D95F0E", method = "loess") +
+  labs(title = "Random-intercept model: residuals vs fitted", x = "Fitted", y = "Residual")
+save_fig(p_fit, "04_lmm_residuals.png", h = 3.6)
+```
+
+# Generalized estimating equations
+
+GEE models the **population-averaged** mean and treats the within-patient
+correlation as a nuisance. Robust (sandwich) standard errors keep inference valid
+even when the working correlation is misspecified.
+
+```{r gee}
+data_gee <- data_long |> arrange(id, time_numeric)
+
+gee_ind  <- geeglm(biomarker ~ time_numeric * treatment, id = id, data = data_gee,
+                   family = gaussian, corstr = "independence")
+gee_exch <- geeglm(biomarker ~ time_numeric * treatment, id = id, data = data_gee,
+                   family = gaussian, corstr = "exchangeable")
+gee_ar1  <- geeglm(biomarker ~ time_numeric * treatment, id = id, data = data_gee,
+                   family = gaussian, corstr = "ar1")
+
+gee_tab <- map_dfr(
+  list(Independence = gee_ind, Exchangeable = gee_exch, `AR(1)` = gee_ar1),
+  ~ tidy(.x, conf.int = TRUE), .id = "Working correlation"
+) |>
+  select(`Working correlation`, term, estimate, std.error, conf.low, conf.high)
+kable(gee_tab, digits = 3)
+
+c(exchangeable_alpha = gee_exch$geese$alpha, ar1_alpha = gee_ar1$geese$alpha) |> round(3)
+sapply(list(Independence = gee_ind, Exchangeable = gee_exch, `AR(1)` = gee_ar1),
+       function(m) QIC(m)[c("QIC", "CIC")]) |> round(1)
+```
+
+**Comparing working correlations.** Independence and exchangeable give the same
+point estimates. This is expected here: every patient has the same four visit
+times and treatment is constant within a patient, so weighting by an
+exchangeable correlation does not change the least-squares solution. Their robust SEs are also nearly identical. AR(1)
+changes the estimates slightly. QIC mainly reflects the mean model; CIC, the
+penalty part, is designed for choosing the working correlation. Neither suggests
+AR(1) is the better choice. The main finding (time × treatment ≈ −0.53 to −0.56)
+holds under every structure.
+
+## Comparison with the mixed model (like for like)
+
+The task's GEE has no age or sex, while the mixed model has both. For a fair
+comparison I also fit the GEE with the **same covariates** as the mixed model.
+
+```{r gee-vs-lmm}
+gee_exch_adj <- geeglm(biomarker ~ time_numeric * treatment + age_c + sex, id = id,
+                       data = data_gee, family = gaussian, corstr = "exchangeable")
+
+cmp <- full_join(
+  tidy(model_ri, effects = "fixed") |> select(term, LMM = estimate, LMM_SE = std.error),
+  tidy(gee_exch_adj) |> select(term, GEE = estimate, GEE_robust_SE = std.error),
+  by = "term"
+)
+kable(cmp, digits = 3)
+```
+
+With the same covariates, the mixed model and GEE agree almost exactly. **This
+is expected, not a coincidence.** For a continuous outcome with an
+**identity link**, the subject-specific coefficients of a linear mixed model are
+the same as the population-averaged coefficients: averaging
+\(\beta_0 + b_{0i} + \dots\) over patients just removes \(b_{0i}\). The two
+approaches still answer different questions:
+
+* **GEE:** how does the *average* biomarker in the population change, and how
+  does that average differ between treatment groups? Robust to misspecified
+  correlation, but makes no statements about individuals and needs data
+  missing completely at random.
+* **Mixed model:** how does *a given patient's* biomarker change? It models the
+  correlation explicitly, gives patient-level predictions, and stays valid when
+  data are missing at random.
+
+With a **non-linear link** (e.g. logistic regression for a binary outcome) the
+two sets of coefficients differ: subject-specific effects are larger in magnitude
+than population-averaged ones. The choice between them is then substantive,
+not just technical.
+
+# Survival: Kaplan–Meier and log-rank test
+
+```{r km}
+km_fit <- survfit(Surv(follow, death) ~ trt, data = data_wide)
+km_fit
+```
+
+```{r fig-km, fig.height = 4.6}
+km_df <- tidy(km_fit) |>
+  mutate(trt = factor(sub("trt=", "", strata), levels = c("Standard", "New")))
+km_start <- km_df |> distinct(trt) |>
+  mutate(time = 0, estimate = 1, conf.low = 1, conf.high = 1, n.censor = 0)
+km_df <- bind_rows(km_start, km_df) |> arrange(trt, time) |>
+  group_by(trt) |> mutate(time_next = lead(time, default = max(time))) |> ungroup()
+
+lr <- survdiff(Surv(follow, death) ~ trt, data = data_wide)
+lr_p <- pchisq(lr$chisq, df = 1, lower.tail = FALSE)
+
+p_km <- ggplot(km_df, aes(time, estimate, colour = trt, fill = trt)) +
+  geom_step(linewidth = 0.9) +
+  geom_rect(aes(xmin = time, xmax = time_next,
+                ymin = conf.low, ymax = conf.high), alpha = 0.10, colour = NA) +
+  geom_point(data = filter(km_df, n.censor > 0), shape = 3, size = 1.6) +
+  scale_colour_manual(values = trt_cols) + scale_fill_manual(values = trt_cols) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  annotate("text", x = 5.2, y = 0.95, label = sprintf("Log-rank p = %.3f", lr_p)) +
+  labs(x = "Years since baseline", y = "Survival probability",
+       colour = "Treatment", fill = "Treatment",
+       title = "Kaplan–Meier survival by treatment (95% CI; + = censored)") +
+  theme(legend.position = "top")
+save_fig(p_km, "05_kaplan_meier.png", h = 4.6)
+```
+
+```{r km-table}
+summary(km_fit, times = c(1, 2, 3, 5))$table
+summary(km_fit, times = c(1, 2, 3, 5)) |>
+  (\(s) tibble(Treatment = sub("trt=", "", s$strata), Year = s$time,
+               `At risk` = s$n.risk, Survival = s$surv,
+               `95% CI` = sprintf("%.2f–%.2f", s$lower, s$upper)))() |>
+  kable(digits = 2)
+lr
+```
+
+**Findings.** The curves separate within the first year, when about half of
+all deaths occur, and stay apart. Estimated 3-year survival is 57% under
+standard treatment and 73% under the new treatment. Median survival is
+3.5 years (95% CI from 2.9) under standard treatment and is not reached under
+the new treatment. Survival is consistently higher in the
+new-treatment group. Under standard treatment 60 of 134 patients died,
+compared with 31 of 106 under the new treatment. The log-rank test rejects equal
+survival distributions (χ² = 6.8, 1 df, p = 0.009). The new group had fewer deaths
+than expected under the null hypothesis, and the standard group more. Few patients remain at
+risk after about five years, so the right-hand ends of the curves are imprecise.
+
+# Survival: Cox proportional hazards model
+
+```{r cox1}
+cox1 <- coxph(Surv(follow, death) ~ treatment + age + sex, data = data_wide)
+hr_table <- function(m) {
+  tidy(m, exponentiate = TRUE, conf.int = TRUE) |>
+    transmute(Term = term, HR = estimate, `95% CI low` = conf.low,
+              `95% CI high` = conf.high, p = p.value)
+}
+kable(hr_table(cox1), digits = 3)
+```
+
+* **Treatment: HR ≈ 0.56 (95% CI 0.36–0.87).** At any time, a patient on the new
+  treatment has an estimated 44% lower instantaneous risk of death than a
+  comparable patient (same age and sex) on standard treatment. The CI excludes 1.
+* **Age: HR ≈ 1.03 per year**, i.e. about 3% higher hazard per year of age
+  (≈ 37% per decade); the lower CI limit is close to 1.
+* **Sex:** HR ≈ 1.13 with a wide CI that includes 1, so there is no evidence of a sex difference.
+
+## Proportional hazards assumption
+
+The model assumes each hazard ratio is **constant over follow-up**. The
+standard check plots scaled Schoenfeld residuals against time: a flat smooth
+supports the assumption, while a trend means the effect changes over time. The
+plots are supported by the Grambsch–Therneau test. For continuous covariates,
+linearity of the log-hazard (e.g. martingale residuals) and influential
+observations are also worth checking.
+
+```{r ph-test}
+zph1 <- cox.zph(cox1)
+zph1
+```
+
+```{r fig-schoenfeld, fig.height = 3.6, fig.width = 10}
+zph_df <- map_dfr(colnames(zph1$y), \(v)
+  tibble(var = v, time = zph1$x, resid = zph1$y[, v]))
+coef_df <- tibble(var = names(coef(cox1)), beta = coef(cox1))
+p_sch <- ggplot(zph_df, aes(time, resid)) +
+  geom_hline(data = coef_df, aes(yintercept = beta), colour = "grey40", linetype = "dashed") +
+  geom_point(alpha = 0.35, size = 0.9) +
+  geom_smooth(method = "loess", se = TRUE, colour = "#D95F0E", fill = "#D95F0E", alpha = 0.15) +
+  facet_wrap(~ var, scales = "free_y") +
+  labs(title = "Scaled Schoenfeld residuals (KM-transformed time)",
+       x = "Transformed time", y = "β(t) residual")
+save_fig(p_sch, "06_schoenfeld.png", w = 10, h = 3.6)
+```
+
+The dashed line is each covariate's estimated log hazard ratio. Under
+proportional hazards, the smooth \(\hat\beta(t)\) should stay flat around it.
+None of the smooths shows a clear trend (the wiggles stay inside wide bands),
+and none of the tests is significant
+(global p ≈ 0.67), so proportional hazards is a reasonable assumption here.
+
+# Is the baseline biomarker prognostic?
+
+```{r cox2}
+cox2 <- coxph(Surv(follow, death) ~ treatment + age + sex + bio_0, data = data_wide)
+kable(hr_table(cox2), digits = 3)
+
+# HR per 10-unit higher baseline biomarker (a more readable scale)
+round(exp(10 * c(coef(cox2)["bio_0"], confint(cox2)["bio_0", ])), 2)
+
+AIC(cox1, cox2)
+anova(cox1, cox2)   # likelihood-ratio test for adding bio_0
+```
+
+```{r compare-trt}
+bind_rows(
+  `Treatment + age + sex`         = hr_table(cox1) |> filter(Term == "treatment"),
+  `Treatment + age + sex + bio_0` = hr_table(cox2) |> filter(Term == "treatment"),
+  .id = "Model"
+) |> select(-Term) |> kable(digits = 3)
+```
+
+**Interpretation**
+
+* Adjusting for the baseline biomarker moves the treatment HR from **0.56 to 0.61**.
+  The new treatment remains protective (CI 0.39–0.96).
+* `bio_0` is measured **before treatment starts**, so it cannot be a mediator.
+  Treatment cannot act *through* a value recorded before it began. The change in
+  HR is **confounding adjustment**: the new-treatment group happened to start
+  with lower biomarker values (Section 2). If lower baseline values carry lower
+  risk, part of the crude survival advantage reflects that head start, and
+  adjusting removes it. In a properly randomised trial the adjusted estimate is
+  the more precise of the two.
+* **The evidence that `bio_0` is prognostic is weak.** Each 10-unit higher baseline
+  value is associated with about a 41% higher hazard (95% CI 0.94–2.10). The CI
+  includes 1, the likelihood-ratio test gives p ≈ 0.09, and AIC improves by less
+  than 1 point. The direction is
+  plausible; the precision is limited.
+
+## How longitudinal biomarkers and survival relate
+
+In clinical studies a biomarker can be (i) a **prognostic marker** of disease
+severity, (ii) a **mediator** on the causal path from treatment to outcome, or
+(iii) a candidate **surrogate endpoint**. Here, the new treatment both lowers the
+biomarker faster (Sections 5–7) and improves survival (Sections 8–9). That is
+consistent with the biomarker lying on the causal pathway, but these analyses
+cannot show it.
+
+Answering that question would require modelling the **post-baseline**
+trajectory. Putting later biomarker values directly into a Cox model as fixed
+covariates would be wrong: it conditions on the future and creates
+*immortal-time bias*. The data also show why caution is needed. All 240
+patients have a 12-month biomarker value, yet
+`r sum(data_wide$follow < 1 & data_wide$death == 1)` patients died **before**
+12 months. That is an artefact of the simulation, but in real data the
+biomarker would be missing after death (informative dropout). The appropriate
+tools are:
+
+* a **joint longitudinal–survival model** (e.g. `JMbayes2`, `joineRML`), which
+  links each patient's current modelled biomarker value or slope to their hazard
+  and handles informative dropout; or
+* a **landmark analysis**: among patients alive at a landmark time, use the
+  biomarker history up to that time to predict survival afterwards.
+
+# Summary of findings
+
+| Question | Method | Result |
+|---|---|---|
+| Does the biomarker change over time? | RM-ANOVA, LMM | Declines in both groups (≈ 0.90 units/month under standard treatment) |
+| Does the change differ by treatment? | RM-ANOVA, LMM, GEE | Faster decline under the new treatment: extra −0.56 units/month (≈ −1.46 vs −0.90) |
+| Where does the variation lie? | Variance components | ICC ≈ 0.57; patients differ in level, not in rate (random slope variance ≈ 0) |
+| Does the new treatment improve survival? | KM, log-rank, Cox | Yes: log-rank p = 0.009; adjusted HR 0.56 (0.36–0.87); PH holds |
+| Is baseline biomarker prognostic? | Cox | Weak evidence (CI includes 1); adjusting for it moves the treatment HR to 0.61 (0.39–0.96) |
+
+# What was revised from the original coursework {#revisions}
+
+1. **Mediation claim corrected.** The original text said the treatment HR shifted
+   because part of the effect works "through biomarker levels". Because `bio_0`
+   is a pre-treatment variable, the shift is confounding adjustment for a
+   baseline imbalance, not mediation.
+2. **Sphericity checked.** Mauchly's test and Greenhouse–Geisser-corrected tests
+   are now reported (sphericity holds, though strict compound symmetry does not), and residuals come from the repeated-measures model rather
+   than from an `lm()` that ignores patients.
+3. **Fair GEE-vs-LMM comparison.** The GEE is also fitted with the mixed model's
+   covariates. The near-identical estimates are explained by the identity link.
+4. **Boundary-corrected LRT.** The random-slope test uses REML fits and the
+   χ²₁:χ²₂ mixture reference distribution.
+5. **Uncertainty reported.** Standard errors and confidence intervals accompany
+   all fixed effects, and age is centred so the intercept is meaningful.
+6. **Schoenfeld residual plots** are now shown, not just described.
+7. **Reproducibility.** One R Markdown file runs from the raw data to every table
+   and figure, with package versions recorded in `renv.lock`.
+
+# Session information
+
+```{r session}
+sessionInfo()
+```
